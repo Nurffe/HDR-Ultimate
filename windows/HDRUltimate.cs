@@ -71,7 +71,8 @@ namespace HdrUltimate
             object build = Registry.GetValue(@"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion", "CurrentBuild", "unknown");
             Write("--- " + Build.Name + " " + Build.Version + " on Windows build " + build);
             foreach (var m in Hdr.GetMonitors())
-                Write("Monitor: " + m.Label + " | HDR supported=" + m.HdrSupported + " on=" + m.HdrOn);
+                Write("Monitor: " + m.Label + " | HDR supported=" + m.HdrSupported + " on=" + m.HdrOn +
+                    " blocked by policy=" + m.HdrBlockedByPolicy);
         }
 
         public static void Crash(Exception ex, bool canContinue)
@@ -266,6 +267,7 @@ namespace HdrUltimate
         public string Name, GdiName, DevicePath;
         public LUID Adapter; public uint TargetId, SourceId;
         public bool HdrSupported, HdrOn, NewApi;
+        public bool HdrBlockedByPolicy;   // advancedColorLimitedByPolicy, INFO_2 only
 
         public string Label
         {
@@ -325,6 +327,17 @@ namespace HdrUltimate
             return list.OrderBy(x => x.GdiName ?? "").ToList();
         }
 
+        // Three generations of this API, and only the newest can tell HDR apart from wide colour gamut:
+        //
+        // Windows 10 (through 23H2) answers only GET_ADVANCED_COLOR_INFO / SET_ADVANCED_COLOR_STATE
+        // (types 9/10). Their "advanced colour" covers HDR *and* WCG, so "supported" can mean either and
+        // "enabled" cannot say which one is live: HDR support is unknowable, not merely imprecise.
+        // Windows 11 24H2 (build 26100) and later also answer GET_ADVANCED_COLOR_INFO_2 / SET_HDR_STATE
+        // (types 15/16), which split the bits -- HDR and WCG each get a support bit and a user bit -- and
+        // activeColorMode names the one actually active. Only that path reports the true HDR state.
+        // Theming follows the same split: caption colour, border and caption text (DwmSetWindowAttribute
+        // 35, 34, 36) are Windows 11 only, so Windows 10 keeps the plain title bar and honours just the
+        // immersive dark mode flag (20).
         static void ReadState(MonitorInfo m)
         {
             var i2 = new ADVANCED_COLOR_INFO_2();
@@ -333,13 +346,19 @@ namespace HdrUltimate
             {
                 m.NewApi = true;
                 m.HdrSupported = (i2.value & 0x10) != 0;                         // highDynamicRangeSupported
-                m.HdrOn = (i2.value & 0x20) != 0 || i2.activeColorMode == 2;     // highDynamicRangeUserEnabled / HDR active
+                // activeColorMode, not bit 5 (highDynamicRangeUserEnabled): that bit is the user's
+                // preference and stays set with "manage colour for apps" on while the panel is SDR/WCG.
+                m.HdrOn = i2.activeColorMode == 2;
+                m.HdrBlockedByPolicy = (i2.value & 0x8) != 0;                    // advancedColorLimitedByPolicy
                 return;
             }
             var i1 = new ADVANCED_COLOR_INFO();
             i1.header = Native.Header(Native.GET_ADVANCED_COLOR_INFO, typeof(ADVANCED_COLOR_INFO), m.Adapter, m.TargetId);
             if (Native.DisplayConfigGetDeviceInfo(ref i1) == 0)
             {
+                // advancedColorSupported reads as "HDR or WCG" here, so SET_ADVANCED_COLOR_STATE(true) can
+                // switch on WCG alone on a WCG-only panel and still report success, while SET_HDR_STATE
+                // fails there with win32 error 50. Nothing below build 26100 reports the difference.
                 m.HdrSupported = (i1.value & 0x1) != 0;   // advancedColorSupported
                 m.HdrOn = (i1.value & 0x2) != 0;          // advancedColorEnabled
             }
@@ -348,6 +367,10 @@ namespace HdrUltimate
         public static bool SetHdr(MonitorInfo m, bool on)
         {
             bool ok = ApplyHdr(m, on);
+            // A successful set is not proof the display changed: with "manage colour for apps" on, 24H2
+            // accepts the call and can leave the panel in SDR/WCG. Re-read and report what actually happened.
+            // Only the exact path (no test hook) is verified: a hook owns the fake world's state itself.
+            if (ok && ApplyHook == null) { ReadState(m); ok = m.HdrOn == on; }
             ModeGuard.Touched(m.DevicePath); // Windows sets the display mode again when HDR switches
             Log.Write("Set HDR " + (on ? "on" : "off") + " on " + m.Name + ": " + (ok ? "ok" : "FAILED"));
             return ok;
@@ -362,6 +385,8 @@ namespace HdrUltimate
             if (ApplyHook != null) return ApplyHook(m, on);
             var s = new SET_STATE();
             s.value = on ? 1u : 0u;
+            // SET_HDR_STATE has to be tried first: the legacy call still succeeds on 24H2 but can switch on
+            // WCG rather than HDR, so reversing the order pins those machines to the confusing path.
             if (m.NewApi)
             {
                 s.header = Native.Header(Native.SET_HDR_STATE, typeof(SET_STATE), m.Adapter, m.TargetId);
@@ -3529,6 +3554,19 @@ namespace HdrUltimate
             {
                 if (TrayApp.DevBalloon != null)
                     TrayApp.DevBalloon("Updated to " + Build.Version, "The old version (1.2.0) was moved to the Recycle Bin.");
+            });
+            // Re-reads around one real HDR toggle, so SetHdr's read-back is exercised without hunting for a game.
+            add("HDR toggle check", () =>
+            {
+                var mon = first();
+                Log.Write("HDR check before: " + mon.Name + " supported=" + mon.HdrSupported +
+                    " on=" + mon.HdrOn + " blocked=" + mon.HdrBlockedByPolicy);
+                bool target = !mon.HdrOn;
+                bool reported = Hdr.SetHdr(mon, target);
+                Log.Write("HDR check asked " + (target ? "on" : "off") + ", SetHdr reported " +
+                    (reported ? "ok" : "FAILED") + ", HdrOn now=" + mon.HdrOn +
+                    (reported == Hdr.GetMonitors().Any(x => x.DevicePath == mon.DevicePath && x.HdrOn == target)
+                        ? " (agrees)" : " (DISAGREES with a fresh read)"));
             });
             add("Old version prompt", () => Log.Write("Old version prompt answered: " + MessageBox.Show(this,
                 Build.Name + " 1.2.0 is still running.\n\nClose it and switch to " + Build.Version + "?", Build.Name,
