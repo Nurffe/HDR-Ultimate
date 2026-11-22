@@ -4,7 +4,7 @@ A lightweight system-tray app for per-monitor HDR control on Windows 10/11 and L
 
 ## Features
 
-- **Per-monitor hotkeys** to switch HDR on or off for each display
+- **Per-monitor hotkeys** to switch HDR on or off for each display (Windows; on Linux/Wayland you assign a command to a desktop shortcut instead)
 - **Game detection:** when a game you've added starts, HDR Ultimate offers to turn HDR on (or does it automatically with "Always for this game")
 - **Reads the game's own HDR setting** and skips the offer when HDR is off inside the game
 - **Turns HDR back off** when the game closes, unless another HDR game still needs it
@@ -12,6 +12,7 @@ A lightweight system-tray app for per-monitor HDR control on Windows 10/11 and L
 - **Tray icon** showing live HDR status for every monitor, kept in sync with changes made in Windows Settings
 - **Banner and on-screen confirmations** that never steal focus
 - **Light and dark themes**
+- **VRR control on Linux only:** per-monitor and per-game variable refresh rate policy, on KDE Plasma (see [linux/README.md](linux/README.md#vrr-variable-refresh-rate)). Windows has no VRR support.
 
 ## Contact
 
@@ -36,7 +37,7 @@ Grab the latest build from the **Releases** page. Windows needs no installer, ju
 
 ## Windows
 
-Requires Windows 10 or 11. Run the downloaded `.exe` (for example `HDRUltimate1.0.exe`), then look for the icon in the system tray. Open Settings from the tray menu to add games and set hotkeys.
+Requires Windows 10 or 11. Run the downloaded `.exe` (for example `HDRUltimate1.0.exe`), then look for the icon in the system tray. Open Settings from the tray menu to add games and set hotkeys. See [windows/README.md](windows/README.md) for the feature list, differences from Linux and troubleshooting.
 
 ### Build from source
 
