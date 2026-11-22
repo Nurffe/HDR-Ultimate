@@ -318,6 +318,63 @@ class RefreshRates(unittest.TestCase):
         self.assertIsNone(h.pick_mode(mon, 0, 0, 30))
 
 
+class ChoiceLists(unittest.TestCase):
+    """The dropdowns' contents as plain data, so what a menu offers can be tested without Qt."""
+
+    def monitor(self, mid, name, connected=True, hdr=True, modes=(), current=None, policy="automatic"):
+        mon = Monitor(id=mid, name=name, hdr_supported=hdr, modes=list(modes), current=current, vrr_policy=policy)
+        mon.connected = connected
+        return mon
+
+    def test_hdr_summary(self):
+        self.assertEqual(h.hdr_summary(Game(ask=True)), "Ask")
+        self.assertEqual(h.hdr_summary(Game(ask=False)), "On")
+
+    def test_monitor_choices_lists_connected_and_missing(self):
+        on, off = self.monitor("DP-1", "XG32", hdr=False), self.monitor("DP-2", "Gone")
+        rows = h.monitor_choices({"DP-1": "XG32", "DP-3": "Old"}, [on, off])
+        self.assertEqual(rows, [("DP-1", "XG32  — no HDR", True, True),
+                                ("DP-2", "Gone", False, True),
+                                ("DP-3", "Old  — not connected", True, True)])
+
+    def test_monitor_choices_keep_one(self):
+        on, off = self.monitor("DP-1", "XG32"), self.monitor("DP-2", "X27U")
+        rows = h.monitor_choices({"DP-1": "XG32"}, [on, off])
+        # The only checked monitor can't be unchecked: a game always needs one.
+        self.assertEqual([(k, e) for k, _, _, e in rows], [("DP-1", False), ("DP-2", True)])
+        rows = h.monitor_choices({"DP-1": "XG32", "DP-2": "X27U"}, [on, off])
+        self.assertTrue(all(e for _, _, _, e in rows))
+
+    def test_mode_choices_are_separate_menus(self):
+        mon = self.monitor("DP-1", "XG32", modes=[(3840, 2160, 240), (2560, 1440, 480), (2560, 1440, 240)],
+                           current=(2560, 1440, 240))
+        game = Game(mode_monitor="DP-1", mode_width=2560, mode_height=1440, mode_hz=480)
+        choices = h.mode_choices(game, [mon])
+        self.assertEqual(choices["monitor"], [("", "Don't change", False, True), ("DP-1", "XG32", True, True)])
+        self.assertEqual([(v, c) for v, _, c, _ in choices["resolution"]],
+                         [((0, 0), False), ((3840, 2160), False), ((2560, 1440), True)])
+        self.assertEqual([v for v, _, _, _ in choices["refresh"]], [0, 480, 240])
+        self.assertFalse(choices["in_game"])
+
+    def test_mode_choices_refresh_lists_every_rate(self):
+        mon = self.monitor("DP-1", "XG32", modes=[(2560, 1440, 480), (2560, 1440, 240), (1920, 1080, 120)],
+                           current=(2560, 1440, 240))
+        game = Game(mode_monitor="DP-1", mode_width=1920, mode_height=1080, mode_hz=120)
+        rates = [v for v, _, _, _ in h.mode_choices(game, [mon])["refresh"]]
+        # The menu is built once, so it lists every rate the monitor has; pick_size pulls the chosen one down.
+        self.assertEqual(rates, [0, 480, 240, 120])
+
+    def test_mode_choices_without_a_monitor(self):
+        choices = h.mode_choices(Game(), [self.monitor("DP-1", "XG32", modes=[(2560, 1440, 240)])])
+        self.assertEqual(choices["resolution"], [])  # nothing to pick until a monitor is chosen
+        self.assertEqual(choices["refresh"], [])
+
+    def test_mode_choices_keeps_a_disconnected_choice(self):
+        choices = h.mode_choices(Game(mode_monitor="DP-9", mode_width=2560, mode_height=1440), [])
+        self.assertIn(("DP-9", "DP-9  — not connected", True, True), choices["monitor"])
+        self.assertEqual(choices["resolution"], [])
+
+
 class UpdateCheck(unittest.TestCase):
     def test_versions(self):
         self.assertEqual(h.parse_version("V1.2"), (1, 2, 0))
@@ -553,7 +610,8 @@ class Vrr(unittest.TestCase):
         holds = h.VrrHolds()
         a = self.monitor("automatic")
         self.assertEqual(holds.start("game.exe", [a]), [(a, "always")])
-        self.assertEqual(holds.held["DP-1"], {"before": "automatic", "games": ["game.exe"], "manual": False})
+        self.assertEqual(holds.held["DP-1"], {"before": "automatic", "after": "always", "games": ["game.exe"],
+                                                 "manual": False})
         self.assertEqual(holds.start("game.exe", [a]), [])  # already held by this game
         on = self.monitor("always", vrr_on=True)            # what the monitor reads after the write
         self.assertEqual(holds.stop("game.exe", [on]), [(on, "automatic")])
@@ -605,7 +663,7 @@ class Vrr(unittest.TestCase):
         holds = h.VrrHolds(saved)
         self.assertEqual(holds.held["DP-2"]["before"], "automatic")  # clamped to a real word on load
         # DP-1's only holder is gone; DP-2's is still running, so only DP-1 comes back.
-        self.assertEqual(holds.forget_games({"running.exe"}), [("DP-1", "automatic")])
+        self.assertEqual(holds.forget_games({"running.exe"}), [("DP-1", "automatic", "always")])
         self.assertEqual(holds.held["DP-2"]["games"], ["running.exe"])
         self.assertEqual(h.VrrHolds({}).forget_games(set()), [])
         # A manual "on" survives a restart even with no game running.
@@ -614,10 +672,10 @@ class Vrr(unittest.TestCase):
         self.assertEqual(list(manual.held), ["DP-1"])
         # A hold that never landed is forgotten without a write.
         ghost = h.VrrHolds({"DP-1": {"before": "never", "games": ["gone.exe"], "manual": False}})
-        self.assertEqual(ghost.forget_games(set()), [("DP-1", "never")])
+        self.assertEqual(ghost.forget_games(set()), [("DP-1", "never", "always")])
 
     def test_vrr_inert(self):
-        on, off = Game(name="G", vrr=True), Game(name="G")
+        on, off = Game(name="G", vrr="always"), Game(name="G")
         self.assertTrue(h.vrr_inert(on, True))
         self.assertFalse(h.vrr_inert(on, False))
         self.assertFalse(h.vrr_inert(off, True))
@@ -646,8 +704,50 @@ class Vrr(unittest.TestCase):
         self.assertTrue(loaded.vrr_system_managed)  # a config written before VRR existed still loads
         self.assertEqual(loaded.vrr_held, {})
         self.assertFalse(loaded.vrr_ours)
-        self.assertEqual([g.vrr for g in loaded.games], [False])
+        self.assertEqual([g.vrr for g in loaded.games], [""])
         self.assertFalse(h.Game(name="G").vrr)
+
+    def test_games_can_ask_for_never(self):
+        # Off while playing: the mirror image of Always, held and put back the same way.
+        holds = h.VrrHolds()
+        a = self.monitor("automatic")
+        self.assertEqual(holds.start("game.exe", [a], "never"), [(a, "never")])
+        self.assertEqual(holds.held["DP-1"]["after"], "never")
+        off = self.monitor("never")
+        self.assertEqual(holds.stop("game.exe", [off]), [(off, "automatic")])
+        # Already Never without us: nothing written, nothing recorded.
+        self.assertEqual(holds.start("game.exe", [off], "never"), [])
+        self.assertEqual(holds.held, {})
+
+    def test_game_vrr_values_survive_a_config_round_trip(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = pathlib.Path(folder) / "config.json"
+            cfg = h.Config()
+            cfg.games = [h.Game(name="A", vrr="never"), h.Game(name="B", vrr="always"), h.Game(name="C")]
+            with mock.patch.object(h.Config, "path", staticmethod(lambda: path)):
+                cfg.save()
+                loaded = h.Config.load()
+        self.assertEqual([g.vrr for g in loaded.games], ["never", "always", ""])
+
+    def test_old_boolean_vrr_flag_migrates(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = pathlib.Path(folder) / "config.json"
+            path.write_text(json.dumps({"games": [{"name": "was on", "vrr": True}, {"name": "was off", "vrr": False},
+                                                {"name": "bogus", "vrr": "sometimes"}]}), encoding="utf-8")
+            with mock.patch.object(h.Config, "path", staticmethod(lambda: path)):
+                loaded = h.Config.load()
+        self.assertEqual([g.vrr for g in loaded.games], ["always", "", ""])
+
+    def test_vrr_summary(self):
+        self.assertEqual(h.vrr_summary(h.Game(vrr="always")), "On")
+        self.assertEqual(h.vrr_summary(h.Game(vrr="never")), "Off")
+        self.assertEqual(h.vrr_summary(h.Game()), "No change")
+
+    def test_holds_from_before_never_existed_put_always_back(self):
+        holds = h.VrrHolds({"DP-1": {"before": "automatic", "games": ["game.exe"], "manual": False}})
+        self.assertEqual(holds.held["DP-1"]["after"], "always")
+        on = self.monitor("always", vrr_on=True)
+        self.assertEqual(holds.stop("game.exe", [on]), [(on, "automatic")])
 
 
 

@@ -76,7 +76,8 @@ class Game:
     ask: bool = True            # ask before turning HDR on
     skip_if_off: bool = False   # don't offer HDR when the game's own HDR option is off
     oled_care: bool = True      # turn HDR off while tabbed out of the game
-    vrr: bool = False           # VRR on while this game runs, always put back when it closes
+    # VRR while this game runs: one of VRR_WORDS, or "" for no change. Always put back when it closes.
+    vrr: str = ""
     monitors: dict = field(default_factory=dict)  # connector -> display name
     # Display mode while the game runs, on one monitor. Blank monitor = leave it; zero = keep that part.
     mode_monitor: str = ""
@@ -141,6 +142,9 @@ class Config:
                 setattr(c, key, value)
         game_fields = {f.name for f in fields(Game)}
         c.games = [Game(**{k: v for k, v in g.items() if k in game_fields}) for g in data.get("games", [])]
+        for g in c.games:
+            # Games written before VRR became a policy carried a plain on/off flag.
+            g.vrr = ("always" if g.vrr else "") if isinstance(g.vrr, bool) else g.vrr if g.vrr in VRR_WORDS else ""
         c.oled_minutes = max(OLED_MIN_MINUTES, min(OLED_MAX_MINUTES, int(c.oled_minutes)))
         return c
 
@@ -341,6 +345,61 @@ def mode_summary(game):
     if game.mode_in_game:
         parts.append("in-game")
     return " ".join(parts)
+
+
+def hdr_summary(game):
+    """Short text for the games list: whether HDR is offered when the game starts."""
+    return "Ask" if game.ask else "On"
+
+
+def vrr_summary(game):
+    """Short text for the games list: the VRR policy this game asks for while it runs."""
+    return {"always": "On", "never": "Off"}.get(game.vrr, "No change")
+
+
+def monitor_choices(selected, connected):
+    """The Monitors dropdown, as (id, label, checked, enabled). A game always keeps one monitor, so the
+    last checked row cannot be unchecked. Monitors that are no longer connected stay listed."""
+    chooser = list(connected)
+    known = {m.id for m in chooser}
+    rows = [(m.id, m.name + ("" if m.hdr_supported else "  — no HDR"), m.id in selected, True) for m in chooser]
+    rows += [(key, name + "  — not connected", True, True) for key, name in selected.items() if key not in known]
+    if len(selected) == 1:
+        only = next(iter(selected))
+        rows = [(key, label, checked, enabled and key != only) for key, label, checked, enabled in rows]
+    return rows
+
+
+def mode_choices(game, connected):
+    """The game's display mode setting as a monitor, a resolution and a refresh rate, each chosen on its own.
+
+    Returns {"monitor": [...], "resolution": [...], "refresh": [...], "in_game": bool}, every list made of
+    (value, label, checked, enabled). resolution and refresh are empty when no monitor is set."""
+    ids = [m.id for m in connected]
+    labels = {m.id: m.name for m in connected}
+    if game.mode_monitor and game.mode_monitor not in ids:
+        ids.append(game.mode_monitor)
+        labels[game.mode_monitor] = game.monitors.get(game.mode_monitor, game.mode_monitor) + "  — not connected"
+    monitor = [("", "Don't change", not game.mode_monitor, True)]
+    monitor += [(key, label, key == game.mode_monitor, True) for key, label in
+                ((m.id, labels[m.id]) for m in connected)]
+    monitor += [(key, labels[key], True, True) for key in ids if key not in {m.id for m in connected}]
+    mon = next((m for m in connected if m.id == game.mode_monitor), None)
+    if mon is None:
+        return {"monitor": monitor, "resolution": [], "refresh": [], "in_game": False}
+    sizes = list(dict.fromkeys(m[:2] for m in mon.modes if m[0] > 0))
+    size = (game.mode_width, game.mode_height) if game.mode_width > 0 else (mon.current[:2] if mon.current else None)
+    resolution = [((0, 0), "Don't change", game.mode_width == 0, True)]
+    resolution += [(s, "%d × %d" % s + ("  (current)" if mon.current and s == mon.current[:2] else ""),
+                    s == (game.mode_width, game.mode_height), True) for s in sizes]
+    # Every rate the monitor offers, whatever the size: the menu is built once, so a list that depended on the
+    # resolution just chosen would be stale. Picking a size pulls the rate down to one it offers (see pick_size).
+    rates = sorted({m[2] for m in mon.modes if m[2] > 0} | ({game.mode_hz} if game.mode_hz > 0 else set()), reverse=True)
+    same = mon.current is not None and size == mon.current[:2]
+    refresh = [(0, "Don't change", game.mode_hz == 0, True)]
+    refresh += [(r, "%d Hz" % r + ("  (current)" if same and r == mon.current[2] else ""),
+                 r == game.mode_hz, True) for r in rates]
+    return {"monitor": monitor, "resolution": resolution, "refresh": refresh, "in_game": game.mode_in_game}
 
 
 def game_name_for(exe):
@@ -868,29 +927,36 @@ def vrr_blocked(monitor, manages_vrr, ours, blocked):
 
 
 class VrrHolds:
-    """Who turned VRR on for which monitor, and which policy to put back.
+    """Who changed which monitor's VRR policy, and which policy to put back.
 
-    held: monitor id -> {"before": word, "games": [exe keys], "manual": bool}
+    held: monitor id -> {"before": word, "after": word, "games": [exe keys], "manual": bool}
     Methods return [(monitor, word)] writes; the caller performs them and calls save().
     """
 
     def __init__(self, held=None):
         self.held = {k: {"before": v.get("before") if v.get("before") in VRR_WORDS else "automatic",
+                         # Holds written before games could ask for Never are all Always holds.
+                         "after": v.get("after") if v.get("after") in VRR_WORDS else "always",
                          "games": list(v.get("games", ())), "manual": bool(v.get("manual"))}
                      for k, v in (held or {}).items()}
 
-    def start(self, key, monitors):
-        """A game started on these VRR-capable monitors."""
+    def ours(self, m, h):
+        """Whether the monitor still reads the policy we wrote, or the user changed it mid-game."""
+        return m.vrr_policy == h["after"]
+
+    def start(self, key, monitors, word="always"):
+        """A game started on these VRR-capable monitors and asks for this policy."""
         writes = []
         for m in monitors:
             h = self.held.get(m.id)
             if h is None:
-                if m.vrr_on:
-                    continue  # already Always, not by us: not ours to undo
-                h = self.held[m.id] = {"before": m.vrr_policy, "games": [], "manual": False}
-                writes.append((m, "always"))
+                if m.vrr_policy == word:
+                    continue  # already in that policy, not by us: not ours to undo
+                h = self.held[m.id] = {"before": m.vrr_policy, "after": word, "games": [], "manual": False}
+                writes.append((m, word))
+            # A second game joins the existing hold; the first holder's policy stays in force.
             if key not in h["games"]:
-                h["games"].append(key)  # a second game joins the existing hold
+                h["games"].append(key)
         return writes
 
     def stop(self, key, monitors):
@@ -904,7 +970,7 @@ class VrrHolds:
             if h["games"] or h["manual"]:
                 continue
             del self.held[m.id]
-            if m.vrr_on:  # the user changed it mid-game: keep their choice
+            if self.ours(m, h):  # the user changed it mid-game: keep their choice
                 writes.append((m, h["before"]))
         return writes
 
@@ -936,22 +1002,23 @@ class VrrHolds:
             if keep_manual:
                 h["games"].clear()
             del self.held[m.id]
-            if m.vrr_on:
+            if self.ours(m, h):
                 writes.append((m, h["before"]))
         return writes
 
     def forget_games(self, running_keys):
         """Startup: drops the holds of games that are no longer running (crash recovery).
 
-        Returns [(monitor, word)] for the monitors whose last holder was gone, so the caller can put
-        them back. A monitor another game or a manual "on" still needs stays held.
+        Returns [(monitor id, before, after)] for the monitors whose last holder was gone, so the
+        caller can put them back (only where the monitor still reads `after`). A monitor another
+        game or a manual "on" still needs stays held.
         """
         writes = []
         for mid, h in list(self.held.items()):
             h["games"] = [k for k in h["games"] if k in running_keys]
             if not h["games"] and not h["manual"]:
                 del self.held[mid]
-                writes.append((mid, h["before"]))
+                writes.append((mid, h["before"], h["after"]))
         return writes
 
 
@@ -1007,8 +1074,8 @@ def tray_state_icon(checked):
 
 
 def vrr_inert(game, system_managed):
-    """True when this game asks for VRR but it won't be applied."""
-    return game.vrr and system_managed
+    """True when this game asks for a VRR policy but it won't be applied."""
+    return bool(game.vrr) and system_managed
 
 
 # ------------------------------------------------------------------ A game's own settings
@@ -1255,7 +1322,7 @@ class Startup:
 
 def run_ui(args):
     from PySide6.QtCore import QObject, QPoint, QPointF, QRectF, QSize, Qt, QTimer, Signal
-    from PySide6.QtGui import (QAction, QColor, QFont, QFontDatabase, QGuiApplication, QIcon, QLinearGradient, QPainter,
+    from PySide6.QtGui import (QAction, QActionGroup, QColor, QFont, QFontDatabase, QGuiApplication, QIcon, QLinearGradient, QPainter,
                                QPainterPath, QPalette, QPen, QPixmap)
     from PySide6.QtNetwork import QLocalServer, QLocalSocket
     from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
@@ -1591,16 +1658,36 @@ def run_ui(args):
                                               "Windows or Linux games (*.exe *);;All files (*)")
         return path or None
 
+    def monitor_menu(menu, selected, connected, on_change):
+        """Adds one checkable action per monitor to `menu`, the same rows the dialog and the games table use.
+
+        A game always keeps one monitor, so the last ticked action is disabled. `on_change(selected)`
+        runs after every tick with the resulting selection; the selection itself is the caller's."""
+        chosen = dict(selected)
+        names = {m.id: m.name for m in connected}
+
+        def pick(key, on):
+            if on:
+                chosen[key] = names.get(key, chosen.get(key, key))
+            elif len(chosen) > 1:  # the last row is disabled, but a race must not empty the list
+                chosen.pop(key, None)
+            on_change(chosen)
+
+        for key, label, checked, enabled in monitor_choices(selected, connected):
+            act = menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(checked)
+            act.setEnabled(enabled)  # the last monitor can't be unchecked
+            act.toggled.connect(lambda on, k=key: pick(k, on))
+        return chosen
+
     class MonitorMenu(QPushButton):
-        """Dropdown with a checkbox per monitor."""
+        """Dropdown with a checkbox per monitor (see monitor_choices for the rows)."""
 
         def __init__(self, selected, connected):
             super().__init__()
             self.chosen = dict(selected)
-            self.options = {m.id: m.name + ("" if m.hdr_supported else "  — no HDR") for m in connected}
-            for key, name in selected.items():
-                self.options.setdefault(key, name + "  — not connected")
-            self.names = {m.id: m.name for m in connected}
+            self.connected = list(connected)
             self.on_change = None
             self.clicked.connect(self.open_menu)
             self.refresh()
@@ -1610,18 +1697,11 @@ def run_ui(args):
 
         def open_menu(self):
             menu = QMenu(self)
-            for key, label in self.options.items():
-                act = menu.addAction(label)
-                act.setCheckable(True)
-                act.setChecked(key in self.chosen)
-                act.toggled.connect(lambda on, k=key: self.pick(k, on))
+            monitor_menu(menu, self.chosen, self.connected, self.pick)
             menu.exec(self.mapToGlobal(QPoint(0, self.height())))
 
-        def pick(self, key, on):
-            if on:
-                self.chosen[key] = self.names.get(key, key)
-            else:
-                self.chosen.pop(key, None)
+        def pick(self, chosen):
+            self.chosen = chosen
             self.refresh()
             if self.on_change:
                 self.on_change()
@@ -1649,9 +1729,12 @@ def run_ui(args):
             self.if_off = self.choice(0 if game.skip_if_off else 1, "Leave HDR off", "Offer HDR anyway")
             self.on_close = self.choice(0 if game.restore else 1, "Turn HDR back off", "Leave HDR on")
             self.tabbed = self.choice(1 if game.oled_care else 0, "Keep HDR on", "Turn HDR off (OLED care)")
-            self.vrr = self.choice(1 if game.vrr else 0, "Leave VRR alone", "Turn VRR on while playing")
+            # Same three states as the games table: On is Always, Off is Never, the third leaves it alone.
+            self.vrr_words = ("always", "never", "")
+            self.vrr = self.choice(self.vrr_words.index(game.vrr) if game.vrr in self.vrr_words else 2,
+                                   "Turn VRR on while playing", "Turn VRR off while playing", "No change")
             if not self.a_manages_vrr(connected, selected):
-                self.vrr.setEnabled(False)
+                self.vrr.setEnabled(False)  # "No change" is still the right answer there
             # Display mode: the monitor, then the resolutions and refresh rates it offers.
             self.connected = connected
             self.mode_ids = [m.id for m in connected]
@@ -1674,7 +1757,7 @@ def run_ui(args):
                                ("If HDR is off in the game", self.if_off), ("When the game closes", self.on_close),
                                ("When tabbed out", self.tabbed), ("Display mode on", self.mode_monitor),
                                ("Resolution", self.resolution), ("Resolution applies to", self.apply_to),
-                               ("Refresh rate", self.refresh), ("VRR", self.vrr)):
+                               ("Refresh rate", self.refresh), ("VRR while playing", self.vrr)):
                 form.addRow(label, box)
             self.vrr_hint = muted("Put back to the previous setting when the game closes.")
             form.addRow("", self.vrr_hint)
@@ -1781,7 +1864,7 @@ def run_ui(args):
                 (g.mode_width, g.mode_height), g.mode_hz = self.selected_size(), self.selected_hz()
                 g.mode_in_game = self.apply_to.currentIndex() == 1
                 g.mode_monitor = self.mode_ids[self.mode_monitor.currentIndex()] if g.mode_width or g.mode_hz else ""
-                g.vrr = self.vrr.currentIndex() == 1
+                g.vrr = self.vrr_words[self.vrr.currentIndex()]
                 if g.vrr and not self.original_vrr and not cfg.vrr_ours and not self.vrr_warning():
                     return  # the dialog stays open, with every other edit intact (self.game is a copy)
                 self.accept()
@@ -1849,8 +1932,11 @@ def run_ui(args):
             theme.changed.connect(self.repaint_logo)
             self.repaint_logo()
 
+            # Cells that open a dropdown of their own; the others open the full dialog or an action menu.
+            self.DROPDOWNS = ("Monitors", "Display mode", "VRR", "HDR")
+            self.click_open = None  # (row, col) waiting out the double-click interval
             self.columns = (["Game", "Exe", "Monitors"] + (["In-game HDR"] if Build.dev() else [])
-                            + ["Display mode"] + (["VRR"] if self.a.backend.manages_vrr else []) + ["On launch"])
+                            + ["Display mode"] + (["VRR"] if self.a.backend.manages_vrr else []) + ["HDR"])
             self.table = QTableWidget(0, len(self.columns))
             self.table.setHorizontalHeaderLabels(self.columns)
             self.table.verticalHeader().hide()
@@ -1865,7 +1951,11 @@ def run_ui(args):
             header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
             header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
             header.setHighlightSections(False)
-            self.table.cellDoubleClicked.connect(self.cell_menu)
+            # A single click opens the dropdown cells; the action cells (Game, Exe) still need a double-click
+            # because one of their actions removes the game. Enter/Space and F2/menu key open any cell.
+            self.table.cellClicked.connect(self.cell_click)
+            self.table.cellDoubleClicked.connect(self.cell_double)
+            self.table.keyPressEvent = self.table_key(self.table.keyPressEvent)
 
             tabs = QTabWidget()
             tabs.addTab(self.games_page(), "HDR games")
@@ -1896,7 +1986,7 @@ def run_ui(args):
             lay = QVBoxLayout(page)
             lay.setContentsMargins(18, 12, 18, 16)
             top = QHBoxLayout()
-            top.addWidget(muted("Double-click a cell to change it"), 1)
+            top.addWidget(muted("Click a cell and pick an option from the dropdown"), 1)
             top.addWidget(button("Add game", self.add_game, True))
             lay.addLayout(top)
             lay.addWidget(self.table, 1)
@@ -1912,6 +2002,17 @@ def run_ui(args):
                 lay.addWidget(r)
             lay.addStretch(1)
             return page
+
+        def table_key(self, base):
+            """Enter, Space, F2 and the menu key open the selected cell, so the table works without a mouse."""
+            def keyPressEvent(event):
+                row, col = self.table.currentRow(), self.table.currentColumn()
+                keys = (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space, Qt.Key.Key_F2, Qt.Key.Key_Menu)
+                if row >= 0 and col >= 0 and event.key() in keys and self.table.state() == QAbstractItemView.State.NoState:
+                    self.cell_menu(row, col)
+                    return
+                base(event)
+            return keyPressEvent
 
         def general_page(self):
             modes = ["system", "light", "dark"]
@@ -1942,33 +2043,34 @@ def run_ui(args):
                 self.vrr_hint.setVisible(managed)
                 self.refill()
 
+            # Ordered by what a user changes, not by insertion: the version and update rows sit at the bottom,
+            # below the one switch that can make the VRR settings above it inert, and the desktop line is last.
             rows = [line("Theme", box),
                     line("Start at login", Toggle(Startup.enabled(), Startup.set)),
                     line("On-screen notice", Toggle(cfg.show_osd, flag("show_osd"))),
-                    line("Auto HDR for games", Toggle(cfg.games_enabled, flag("games_enabled"))),
-                    muted("Desktop: " + self.a.backend.desktop)]
+                    line("Auto HDR for games", Toggle(cfg.games_enabled, flag("games_enabled")))]
             if self.a.backend.manages_vrr:
-                rows.insert(4, line("Let the system manage VRR", Toggle(cfg.vrr_system_managed, set_vrr_system)))
+                rows.append(line("Let the system manage VRR", Toggle(cfg.vrr_system_managed, set_vrr_system)))
             else:
                 dead = Toggle(cfg.vrr_system_managed, None)
                 dead.setEnabled(False)
-                rows.insert(4, line("Let the system manage VRR", dead))
+                rows.append(line("Let the system manage VRR", dead))
             self.vrr_hint = warning("VRR is left to your desktop: no tray switch, hotkey or per-game change is applied.")
-            rows.insert(5, self.vrr_hint)
             self.vrr_warning = muted("VRR management needs KDE Plasma" if not self.a.backend.manages_vrr else "")
-            rows.insert(6, self.vrr_warning)
+            rows += [self.vrr_hint, self.vrr_warning]
             self.vrr_hint.setVisible(cfg.vrr_system_managed and self.a.backend.manages_vrr)
             self.vrr_warning.setVisible(not self.a.backend.manages_vrr)
+            if Usage.offered():
+                rows.append(line("Anonymous active user count", Toggle(cfg.usage_enabled, flag("usage_enabled"))))
             if Updates.offered():
                 latest = self.a.updates.latest
-                rows.insert(4, line("Version %s%s" % (VERSION, "  ·  %s is available" % latest if latest else ""),
-                                    button("Download" if latest else "Releases", self.a.updates.open, primary=bool(latest))))
-                rows.insert(4, line("Check for updates", Toggle(cfg.updates_enabled, flag("updates_enabled"))))
-            if Usage.offered():
-                rows.insert(4, line("Anonymous active user count", Toggle(cfg.usage_enabled, flag("usage_enabled"))))
+                rows.append(line("Check for updates", Toggle(cfg.updates_enabled, flag("updates_enabled"))))
+                rows.append(line("Version %s%s" % (VERSION, "  ·  %s is available" % latest if latest else ""),
+                                 button("Download" if latest else "Releases", self.a.updates.open, primary=bool(latest))))
             if Build.channel != "release":
-                rows.insert(4, line("Logs  (%s %s)" % (Build.channel, VERSION), button(
+                rows.append(line("Logs  (%s %s)" % (Build.channel, VERSION), button(
                     "Open folder", lambda: subprocess.Popen(["xdg-open", str(Build.dir())]))))
+            rows.append(muted("Desktop: " + self.a.backend.desktop))
             return self.stack(*rows)
 
         def hotkeys_page(self):
@@ -2098,11 +2200,15 @@ def run_ui(args):
                     cells.append({True: "On", False: "Off"}.get(GameConfig.enabled_in(g.config), "—"))
                 cells.append(mode_summary(g))
                 if self.a.backend.manages_vrr:
-                    cells.append("On" if g.vrr else "—")
-                cells.append("Ask" if g.ask else "Automatic")
+                    cells.append(vrr_summary(g))
+                cells.append(hdr_summary(g))
                 for col, text in enumerate(cells):
+                    if self.columns[col] in self.DROPDOWNS and text:
+                        text += "  ▾"  # this cell opens a dropdown: the caret says so without a click
                     item = QTableWidgetItem(text)
                     item.setToolTip(g.exe)
+                    if self.columns[col] in self.DROPDOWNS:
+                        item.setToolTip("Click, or select and press Enter, to change it")
                     if self.columns[col] == "VRR" and vrr_inert(g, cfg.vrr_system_managed):
                         item.setForeground(QColor(theme.p["muted"]))
                         item.setToolTip("Not applied — VRR is managed by your system")
@@ -2137,13 +2243,29 @@ def run_ui(args):
         def vrr_warning(self):
             return vrr_warning(self)
 
+        def cell_click(self, row, col):
+            """A single click opens a dropdown cell, after the double-click interval so a double-click can still
+            cancel it (the second click would otherwise land in the open menu and pick whatever is under the
+            cursor). Action cells (Game, Exe) keep their double-click."""
+            if self.columns[col] not in self.DROPDOWNS:
+                return
+            self.click_open = (row, col)
+            QTimer.singleShot(QApplication.doubleClickInterval(), lambda: self.open_clicked(row, col))
+
+        def open_clicked(self, row, col):
+            if self.click_open == (row, col):
+                self.click_open = None
+                self.cell_menu(row, col)
+
+        def cell_double(self, row, col):
+            self.click_open = None  # the click that came first must not open a menu too
+            if self.columns[col] not in self.DROPDOWNS:
+                self.cell_menu(row, col)
+
         def cell_menu(self, row, col):
-            """Double-clicking a cell opens that cell's options as a dropdown."""
+            """Opening a cell (click, double-click, Enter or the menu key) shows that cell's options as a dropdown."""
             g = cfg.games[row]
             title = self.columns[col]
-            if title == "Display mode":  # resolution and refresh rate need several pickers, so open the full options
-                self.edit_game(row)
-                return
             menu = QMenu(self)
             if title == "Game":
                 menu.addAction("Rename / edit all options…", lambda: self.edit_game(row))
@@ -2160,35 +2282,122 @@ def run_ui(args):
                 menu.addAction("Choose a different exe…", change)
                 menu.addAction("Open file location", lambda: subprocess.Popen(["xdg-open", os.path.dirname(g.exe)]))
             elif title == "Monitors":
-                chooser = MonitorMenu(g.monitors, self.a.backend.monitors())
-                menu.deleteLater()
-                chooser.open_menu()
-                if chooser.chosen:  # a game always needs at least one monitor
-                    g.monitors = chooser.chosen
+                def pick_monitors(chosen):
+                    g.monitors = chosen
                     self.saved()
-                return
+
+                monitor_menu(menu, g.monitors, self.a.backend.monitors(), pick_monitors)
+                menu.addSeparator()
+                menu.addAction("More options…", lambda: self.edit_game(row))
+            elif title == "Display mode":
+                self.mode_menu(g, row, menu)
             elif title == "VRR":
-                def set_vrr(on):
-                    if on and not g.vrr and not cfg.vrr_ours and not self.vrr_warning():
+                def set_vrr(word):
+                    if word == "always" and not g.vrr and not cfg.vrr_ours and not self.vrr_warning():
                         return
-                    g.vrr = on
+                    g.vrr = word
                     self.saved()
-                menu.addAction("Leave VRR alone", lambda: set_vrr(False))
-                menu.addAction("Turn VRR on while playing", lambda: set_vrr(True))
+
+                group = QActionGroup(menu)
+                for word, label in (("always", "Turn VRR on while playing"), ("never", "Turn VRR off while playing"),
+                                    ("", "No change")):
+                    act = menu.addAction(label)
+                    act.setCheckable(True)
+                    act.setChecked(g.vrr == word)
+                    act.setActionGroup(group)
+                    act.triggered.connect(lambda _=False, w=word: set_vrr(w))
+                if vrr_inert(g, cfg.vrr_system_managed):
+                    menu.addSeparator()
+                    hint = menu.addAction("Not applied — VRR is managed by your system")
+                    hint.setEnabled(False)
+                menu.addSeparator()
+                menu.addAction("More options…", lambda: self.edit_game(row))
             elif title == "In-game HDR":
                 def detect():
                     g.config = ""
                     g.config = GameConfig.find(g) or ""
                     self.saved()
                 menu.addAction("Detect again", detect)
-            else:
+            elif title == "HDR":
                 def ask(value):
                     g.ask = value
                     self.saved()
-                menu.addAction("Ask me first", lambda: ask(True))
-                menu.addAction("Turn HDR on automatically", lambda: ask(False))
+
+                group = QActionGroup(menu)
+                for value, label in ((True, "Ask me first"), (False, "Turn HDR on automatically")):
+                    act = menu.addAction(label)
+                    act.setCheckable(True)
+                    act.setChecked(g.ask == value)
+                    act.setActionGroup(group)
+                    act.triggered.connect(lambda _=False, v=value: ask(v))
+                menu.addSeparator()
+                menu.addAction("More options…", lambda: self.edit_game(row))
             rect = self.table.visualRect(self.table.model().index(row, col))
             menu.exec(self.table.viewport().mapToGlobal(rect.bottomLeft()))
+
+        def mode_menu(self, g, row, menu):
+            """Display mode as three dropdowns inside one menu: monitor, resolution, refresh rate."""
+            choices = mode_choices(g, self.a.backend.monitors())
+
+            def pick_monitor(key):
+                g.mode_monitor = key
+                if not key:
+                    g.mode_width = g.mode_height = g.mode_hz = 0
+                self.apply_mode_setting(g)
+
+            def pick_size(size):
+                g.mode_width, g.mode_height = size
+                if not size[0]:
+                    g.mode_hz = 0
+                elif g.mode_hz:
+                    # Keep the rate only where the new resolution offers it, else fall back to a supported one.
+                    mon = next((m for m in self.a.backend.monitors() if m.id == g.mode_monitor), None)
+                    offered = {m[2] for m in mon.modes if m[:2] == size and m[2] > 0} if mon else set()
+                    g.mode_hz = g.mode_hz if not offered or g.mode_hz in offered else fallback_rate(offered, g.mode_hz)
+                self.apply_mode_setting(g)
+
+            def pick_hz(hz):
+                g.mode_hz = hz
+                self.apply_mode_setting(g)
+
+            def sub(title, rows, pick):
+                """One mutually exclusive list: clicking the ticked row again changes nothing."""
+                box = menu.addMenu(title)
+                box.setEnabled(bool(rows))
+                group = QActionGroup(box)
+                for value, label, checked, enabled in rows:
+                    act = box.addAction(label)
+                    act.setCheckable(True)
+                    act.setChecked(checked)
+                    act.setEnabled(enabled)
+                    act.setActionGroup(group)
+                    act.triggered.connect(lambda _=False, v=value: pick(v))
+                return box
+
+            sub("Monitor", choices["monitor"], pick_monitor)
+            sub("Resolution", choices["resolution"], pick_size)
+            sub("Refresh rate", choices["refresh"], pick_hz)
+            menu.addSeparator()
+            group = QActionGroup(menu)
+            for in_game, label in ((False, "Applies to the desktop"), (True, "Written in the game's own settings")):
+                act = menu.addAction(label)
+                act.setCheckable(True)
+                act.setChecked(g.mode_in_game == in_game)
+                act.setActionGroup(group)
+                act.triggered.connect(lambda _=False, v=in_game: self.set_in_game(g, v))
+            menu.addSeparator()
+            menu.addAction("More options…", lambda: self.edit_game(row))
+
+        def set_in_game(self, g, in_game):
+            g.mode_in_game = in_game
+            self.apply_mode_setting(g)
+
+        def apply_mode_setting(self, g):
+            cfg.save()
+            self.refill()
+            # A running game would overwrite it on exit; it's written when the game closes instead.
+            if g.exe_file.lower() not in running_exes([g]):
+                GameConfig.apply_resolution(g)
 
     # ---------------------------------------------------------------- App
     class TrayApp(QObject):
@@ -2504,10 +2713,11 @@ def run_ui(args):
                 self.vrr_reconciled = True
                 mons = {m.id: m for m in self.backend.monitors()}
                 stale = self.vrr.forget_games({g.exe_file.lower() for g in games if g.exe_file.lower() in found})
-                writes = [(mons[mid], word) for mid, word in stale if mid in mons and mons[mid].vrr_on]
+                writes = [(mons[mid], before) for mid, before, after in stale
+                          if mid in mons and mons[mid].vrr_policy == after]
                 if stale:
-                    log("VRR holds dropped after a restart: " + ", ".join("%s -> %s" % (mons[mid].name if mid in mons else mid, word)
-                                                                        for mid, word in stale))
+                    log("VRR holds dropped after a restart: " + ", ".join("%s -> %s" % (mons[mid].name if mid in mons else mid, before)
+                                                                        for mid, before, _ in stale))
                     self.write_vrr(writes, force=True)
             for g in games:
                 key = g.exe_file.lower()
@@ -2704,7 +2914,8 @@ def run_ui(args):
                 self.notify(notice)
 
         def start_vrr(self, g, key):
-            """Holds Always while a game runs. A monitor the desktop can't switch is skipped, not the game."""
+            """Holds the game's policy (Always or Never) while it runs. A monitor the desktop can't switch is
+            skipped, not the game."""
             if not (g.vrr and cfg.vrr_ours and self.backend.manages_vrr):
                 return  # nothing switched, so nothing recorded to undo
             mons = [m for m in self.backend.monitors() if m.id in g.monitors and m.vrr_supported]
@@ -2714,10 +2925,10 @@ def run_ui(args):
                 if m.id not in usable_ids and m.id not in self.vrr_noticed:
                     self.vrr_noticed.add(m.id)
                     self.notify(self.vrr_blocked(m), 9000)
-            writes = self.vrr.start(key, usable)
+            writes = self.vrr.start(key, usable, g.vrr)
             self.write_vrr(writes)
             if writes:
-                log("VRR on for %s (%s)" % (g.name, ", ".join(m.name for m, _ in writes)))
+                log("VRR %s for %s (%s)" % (g.vrr, g.name, ", ".join(m.name for m, _ in writes)))
 
         def start_hdr(self, g, key):
             """Turns HDR on for a game, or asks. Returns True when the mode notice should stay quiet: the HDR banner

@@ -222,10 +222,18 @@ def drive(app, a, folder, theme, QTimer):
     a.guard.clock = time.monotonic
     pump(4)
 
-    # Settings: every cell dropdown, and edit dialog.
+    # Settings: the General page ends with the version, not the VRR switch.
     a.open_settings()
     s = a.settings
     cfg_file = h.Build.dir() / "config.json"
+    general = [w.text() for w in s.sub.widget(0).findChildren(QLabel) if w.text().strip()]
+    # Only release builds show the update/version rows (Usage.offered and Updates.offered are channel-gated).
+    versions = [i for i, t in enumerate(general) if t.startswith("Version ")]
+    check("General lists the VRR switch above the version info",
+          "Let the system manage VRR" in general
+          and general.index("Let the system manage VRR") > 3
+          and all(general.index("Let the system manage VRR") < i for i in versions))
+    check("desktop information is the last row on General", general[-1].startswith("Desktop: "))
     seen = {}
 
     def answer_menu():
@@ -239,27 +247,54 @@ def drive(app, a, folder, theme, QTimer):
             pick.trigger()
         menu.close()
 
-    dialogs = []
-
-    def answer_dialog():
-        dlg = app.activeModalWidget()
-        if dlg is None:
-            QTimer.singleShot(20, answer_dialog)
-            return
-        dialogs.append(dlg.windowTitle())
-        dlg.reject()
-
     for col, title in enumerate(s.columns):
-        if title == "Display mode":  # opens the game's full options instead of a dropdown
-            QTimer.singleShot(20, answer_dialog)
-        else:
-            QTimer.singleShot(20, answer_menu)
+        QTimer.singleShot(20, answer_menu)
         s.cell_menu(1, col)
-    check("every column opens a dropdown", len(seen) == len(s.columns) - 1)
-    check("display mode column opens the game's options", len(dialogs) == 1)
-    check("display mode column shows the mode", s.table.item(2, s.columns.index("Display mode")).text() == "1920×1080"
-          and s.table.item(3, s.columns.index("Display mode")).text() == "1920×1080 60Hz in-game")
+    check("every column opens a dropdown", len(seen) == len(s.columns))
+    check("the last column is HDR, not On launch", s.columns[-1] == "HDR")
+    check("display mode column shows the mode", s.table.item(2, s.columns.index("Display mode")).text().startswith("1920×1080")
+          and s.table.item(3, s.columns.index("Display mode")).text().startswith("1920×1080 60Hz in-game"))
+    check("dropdowns are marked with a caret",
+          all("▾" in s.table.item(0, s.columns.index(t)).text() for t in ("Monitors", "Display mode", "HDR")))
     check("dropdown edits are saved", json.loads(cfg_file.read_text())["games"][1]["ask"] is False)
+
+    # Display mode: three submenus (monitor, resolution, refresh rate) plus where the setting applies.
+    picked = []
+
+    def answer_mode():
+        menu = app.activePopupWidget()
+        if menu is None:
+            QTimer.singleShot(20, answer_mode)
+            return
+        picked.append([m.title() for m in menu.findChildren(type(menu)) if m.title()])
+        sub = next((m for m in menu.findChildren(type(menu)) if m.title() == "Resolution"), None)
+        if sub is not None:
+            act = next((x for x in sub.actions() if x.text().startswith("2560 × 1440")), None)
+            if act is not None:
+                act.trigger()
+        menu.close()
+
+    QTimer.singleShot(20, answer_mode)
+    s.cell_menu(2, s.columns.index("Display mode"))
+    saved = json.loads(cfg_file.read_text())["games"][2]
+    check("display mode dropdown offers separate menus", picked and {"Monitor", "Resolution", "Refresh rate"} <= set(picked[0]))
+    check("choosing a resolution in the dropdown saves it", (saved["mode_width"], saved["mode_height"]) == (2560, 1440))
+
+    def answer_vrr():
+        menu = app.activePopupWidget()
+        if menu is None:
+            QTimer.singleShot(20, answer_vrr)
+            return
+        pick = next((x for x in menu.actions() if x.text() == "Turn VRR off while playing"), None)
+        if pick is not None:
+            pick.trigger()
+        menu.close()
+
+    if "VRR" in s.columns:
+        QTimer.singleShot(20, answer_vrr)
+        s.cell_menu(2, s.columns.index("VRR"))
+        check("VRR dropdown offers On, Off and No change", json.loads(cfg_file.read_text())["games"][2]["vrr"] == "never")
+        check("VRR cell shows the policy", s.table.item(2, s.columns.index("VRR")).text().startswith("Off"))
 
     picker = []
 
@@ -309,6 +344,6 @@ def drive(app, a, folder, theme, QTimer):
 
 h.take_screenshots = drive
 sys.excepthook = lambda kind, value, tb: (failures.append(str(value)), sys.__excepthook__(kind, value, tb))
-code = h.run_ui(SimpleNamespace(toggle=None, make_icon=None, keep=False, screenshot=sys.argv[1]))
+code = h.run_ui(SimpleNamespace(toggle=None, toggle_vrr=None, make_icon=None, keep=False, screenshot=sys.argv[1]))
 print("FAILED" if code else "ALL PASSED", failures)
 sys.exit(code)

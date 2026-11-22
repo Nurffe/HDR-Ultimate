@@ -2,6 +2,17 @@
 
 Per-monitor HDR control with game detection, prompts, banners, OLED care, per-game resolution, refresh rate and VRR, and light/dark themes.
 
+## HDR games
+
+The **HDR games** tab lists one row per game. A cell with a **▾** opens its own dropdown when you click it (or select it and press Enter, Space, F2 or the menu key):
+
+- **Monitors** — a tick per monitor; at least one always stays ticked.
+- **Display mode** — one menu with **Monitor**, **Resolution** and **Refresh rate** submenus, plus whether the setting applies to the desktop or is written into the game's own settings file.
+- **VRR** — **Turn VRR on while playing** (Always), **Turn VRR off while playing** (Never) or **No change**.
+- **HDR** — **Ask me first** or **Turn HDR on automatically** when the game starts.
+
+Every dropdown ends with **More options…**, which opens the full game dialog. The **Game** and **Exe** cells open their action menu on double-click (or with Enter, F2 or the menu key), since one of their actions removes the game.
+
 ## Needs
 
 - Wayland with **KDE Plasma 6** or **GNOME 48+**
@@ -44,7 +55,7 @@ The tray's VRR box is a plain on/off switch: ticked is **Always**, unticked is *
 
 The tray menu lists each monitor, marked with a monitor icon (click it for Settings). Under each name sit its HDR and VRR rows, indented and marked with a ticked box when on and an empty box when off. A greyed row says why: **(N/A)** when the monitor doesn't support it, **(system)** while the system manages VRR (the box still shows the real state), **(paused)** when the desktop had display-mode trouble with that monitor this session.
 
-Per-game VRR is different: the app turns the monitor to Always when the game starts and puts back the exact policy that was there, Automatic included, when the game closes or the app exits. A monitor that was already Always before a game started is not touched and is not turned off afterwards: it wasn't the app's change to undo.
+Per-game VRR is different: the app sets the monitor to the policy the game asks for — Always or Never — when the game starts and puts back the exact policy that was there, Automatic included, when the game closes or the app exits. A monitor that was already in that policy before a game started is not touched and is not changed back afterwards: it wasn't the app's change to undo. Choose **No change** for a game that should leave VRR alone.
 
 **"Let the system manage VRR" (Settings > General)** is on by default. While it is on, the app writes no VRR policy at all: no tray switch, no hotkey, no per-game setting. It is the safe default because a policy change makes the desktop reconfigure the output, exactly like a resolution change. Turn it off — or pick "Let HDR Ultimate manage VRR" from the tray — to control VRR from the app.
 
