@@ -76,6 +76,7 @@ class Game:
     ask: bool = True            # ask before turning HDR on
     skip_if_off: bool = False   # don't offer HDR when the game's own HDR option is off
     oled_care: bool = True      # turn HDR off while tabbed out of the game
+    vrr: bool = False           # VRR on while this game runs, always put back when it closes
     monitors: dict = field(default_factory=dict)  # connector -> display name
     # Display mode while the game runs, on one monitor. Blank monitor = leave it; zero = keep that part.
     mode_monitor: str = ""
@@ -109,9 +110,16 @@ class Config:
     usage_enabled: bool = True  # daily check-in for the active user count; opt-out offered on first run
     usage_asked: bool = False
     usage_day: str = ""         # UTC date of the last check-in
+    vrr_system_managed: bool = True  # "Let the system manage VRR": never write a policy
+    vrr_held: dict = field(default_factory=dict)  # VrrHolds.held, persisted so a crash can be undone
     updates_enabled: bool = True  # look for new releases on GitHub
     update_notified: str = ""   # newest version already announced, so each release is announced once
     games: list = field(default_factory=list)
+
+    @property
+    def vrr_ours(self):
+        """Whether HDR Ultimate is allowed to write a VRR policy at all."""
+        return not self.vrr_system_managed
 
     @staticmethod
     def path():
@@ -299,7 +307,7 @@ def stop_old_copies():
             continue
         if not any(file_name(a) == "hdr_ultimate.py" for a in argv):
             continue
-        if any(a.split("=")[0] in ("--toggle", "--list", "--make-icon", "--screenshot") for a in argv):
+        if any(a.split("=")[0] in ("--toggle", "--toggle-vrr", "--list", "--make-icon", "--screenshot") for a in argv):
             continue  # a one-off command, not the app
         if {"--dev", "--playtest"} & set(argv) != want:
             continue
@@ -342,6 +350,9 @@ def game_name_for(exe):
 
 # ------------------------------------------------------------------ Monitors
 
+VRR_WORDS = ("never", "automatic", "always")  # kscreen-doctor's only accepted vrrpolicy words
+
+
 @dataclass
 class Monitor:
     id: str                     # connector, e.g. DP-1
@@ -351,6 +362,9 @@ class Monitor:
     modes: list = field(default_factory=list)     # (width, height, hz), largest and fastest first
     current: tuple = None                         # (width, height, hz)
     mode_ids: dict = field(default_factory=dict)  # (width, height, hz) -> the desktop's own mode id
+    vrr_supported: bool = False
+    vrr_on: bool = False                          # policy is Always
+    vrr_policy: str = ""                          # never | automatic | always; "" when unknown or incapable
 
 
 def sort_modes(modes):
@@ -454,6 +468,7 @@ def edid_name(connector):
 class KdeBackend:
     """Plasma 6: kscreen-doctor, which reports and sets HDR per output."""
     desktop = "KDE Plasma"
+    manages_vrr = True
     ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
     def __init__(self):
@@ -480,6 +495,13 @@ class KdeBackend:
             if state and current:
                 current.hdr_supported = state.group(1) != "incapable"
                 current.hdr_on = state.group(1) == "enabled"
+            # Vrr:  Never | Automatic | Always | incapable  (always printed, unlike HDR:)
+            vrr = re.match(r"\s*Vrr:\s*(\w+)", line)
+            if vrr and current:
+                word = vrr.group(1).lower()
+                current.vrr_supported = word in VRR_WORDS
+                current.vrr_policy = word if current.vrr_supported else ""
+                current.vrr_on = word == "always"
             # Modes:  1:2560x1440@144*!  2:1920x1080@60   (* = current, ! = preferred)
             if current and re.match(r"\s*Modes:", line):
                 for mode_id, w, h, hz, flags in re.findall(r"(\S+?):(\d+)x(\d+)@([\d.]+)([*!]*)", line):
@@ -519,6 +541,20 @@ class KdeBackend:
                                   capture_output=True, text=True, timeout=10, env=self.env())
             return done.returncode == 0
         except (OSError, subprocess.SubprocessError) as ex:
+            log("kscreen-doctor failed: " + str(ex))
+            return False
+
+    def set_vrr(self, monitor, word):
+        """Sets the VRR policy: never, automatic or always. Not waited on, like set_hdr."""
+        if word not in VRR_WORDS:
+            log("refusing VRR policy %r for %s" % (word, monitor.name))
+            return False
+        try:
+            subprocess.Popen(["kscreen-doctor", "output.%s.vrrpolicy.%s" % (monitor.id, word)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True, env=self.env())
+            return True
+        except OSError as ex:
             log("kscreen-doctor failed: " + str(ex))
             return False
 
@@ -593,6 +629,7 @@ def gnome_config(state, connector, on, wrap_uint, mode_id=None):
 class GnomeBackend:
     """GNOME 48+: Mutter's DisplayConfig D-Bus interface, the same one gdctl uses."""
     desktop = "GNOME"
+    manages_vrr = False
 
     def __init__(self):
         from gi.repository import Gio, GLib
@@ -628,20 +665,39 @@ class GnomeBackend:
     def set_mode(self, monitor, mode):
         return mode in monitor.mode_ids and self.apply(monitor, mode_id=monitor.mode_ids[mode])
 
+    def set_vrr(self, monitor, word):
+        return False  # VRR control is KDE-only for now
+
 
 class FakeBackend:
     desktop = "Simulated"
+    manages_vrr = True
 
     def __init__(self):
         modes = [(3840, 2160, 60), (2560, 1440, 144), (2560, 1440, 60), (1920, 1080, 144), (1920, 1080, 60)]
-        self.list = [Monitor("DP-1", "Test OLED", True, False), Monitor("DP-2", "Test LCD", True, False),
-                     Monitor("HDMI-A-1", "Old TV", False, False)]
+        self.list = [Monitor(id="DP-1", name="Test OLED", hdr_supported=True),
+                     Monitor(id="DP-2", name="Test LCD", hdr_supported=True),
+                     Monitor(id="HDMI-A-1", name="Old TV")]  # the old TV has neither HDR nor VRR
         for m in self.list:
             m.modes, m.current = sort_modes(modes), (2560, 1440, 144)
             m.mode_ids = {mode: "%dx%d@%d" % mode for mode in modes}
+        self.list[0].vrr_supported, self.list[0].vrr_policy = True, "automatic"
+        self.list[1].vrr_supported, self.list[1].vrr_policy = True, "never"
 
     def monitors(self):
-        return [Monitor(m.id, m.name, m.hdr_supported, m.hdr_on, list(m.modes), m.current, dict(m.mode_ids)) for m in self.list]
+        return [Monitor(id=m.id, name=m.name, hdr_supported=m.hdr_supported, hdr_on=m.hdr_on,
+                        modes=list(m.modes), current=m.current, mode_ids=dict(m.mode_ids),
+                        vrr_supported=m.vrr_supported, vrr_on=m.vrr_on, vrr_policy=m.vrr_policy) for m in self.list]
+
+    def set_vrr(self, monitor, word):
+        if word not in VRR_WORDS:
+            return False
+        for m in self.list:
+            if m.id == monitor.id and m.vrr_supported:
+                m.vrr_policy, m.vrr_on = word, word == "always"
+                log("Set VRR %s on %s" % (word, monitor.name))
+                return True
+        return False
 
     def set_hdr(self, monitor, on):
         for m in self.list:
@@ -660,6 +716,7 @@ class FakeBackend:
 
 class NoBackend:
     desktop = "Unsupported desktop"
+    manages_vrr = False
 
     def monitors(self):
         return []
@@ -668,6 +725,9 @@ class NoBackend:
         return False
 
     def set_mode(self, monitor, mode):
+        return False
+
+    def set_vrr(self, monitor, word):
         return False
 
 
@@ -790,6 +850,165 @@ class OledCare:
                 self.off.add(path)
                 turn_off.append(m)
         return restore, turn_off
+
+
+def vrr_blocked(monitor, manages_vrr, ours, blocked):
+    """Why this monitor accepts no VRR write right now, or "" when it does.
+
+    A blocked monitor is one the desktop had trouble switching: HDR still works there, VRR does not.
+    Every write goes through this, so the tray item, the hotkey, a game launch and a queued write
+    all refuse for the same reason and none of them can quietly disagree."""
+    if not manages_vrr:
+        return "VRR management needs KDE Plasma"
+    if not ours:
+        return "VRR is managed by your system"
+    if monitor.id in blocked:
+        return "The desktop had trouble switching this monitor's display mode, so VRR is left alone this session"
+    return ""
+
+
+class VrrHolds:
+    """Who turned VRR on for which monitor, and which policy to put back.
+
+    held: monitor id -> {"before": word, "games": [exe keys], "manual": bool}
+    Methods return [(monitor, word)] writes; the caller performs them and calls save().
+    """
+
+    def __init__(self, held=None):
+        self.held = {k: {"before": v.get("before") if v.get("before") in VRR_WORDS else "automatic",
+                         "games": list(v.get("games", ())), "manual": bool(v.get("manual"))}
+                     for k, v in (held or {}).items()}
+
+    def start(self, key, monitors):
+        """A game started on these VRR-capable monitors."""
+        writes = []
+        for m in monitors:
+            h = self.held.get(m.id)
+            if h is None:
+                if m.vrr_on:
+                    continue  # already Always, not by us: not ours to undo
+                h = self.held[m.id] = {"before": m.vrr_policy, "games": [], "manual": False}
+                writes.append((m, "always"))
+            if key not in h["games"]:
+                h["games"].append(key)  # a second game joins the existing hold
+        return writes
+
+    def stop(self, key, monitors):
+        """A game closed. Restores a monitor only when nothing else still holds it."""
+        writes = []
+        for m in monitors:
+            h = self.held.get(m.id)
+            if not h or key not in h["games"]:
+                continue
+            h["games"].remove(key)
+            if h["games"] or h["manual"]:
+                continue
+            del self.held[m.id]
+            if m.vrr_on:  # the user changed it mid-game: keep their choice
+                writes.append((m, h["before"]))
+        return writes
+
+    def manual(self, m, on):
+        """Tray/hotkey. Returns the word to write, or None for no change."""
+        h = self.held.get(m.id)
+        if on:
+            if m.vrr_on:
+                return None
+            if h is None:
+                self.held[m.id] = {"before": m.vrr_policy, "games": [], "manual": True}
+            else:
+                h["manual"] = True
+            return "always"
+        self.held.pop(m.id, None)  # an explicit "off" ends every hold, games included
+        if not m.vrr_on:
+            return None  # already off: nothing to write, but the hold is gone either way
+        # The tray switch is on/off only: off is Never. Anyone who wants Plasma's Automatic lets the
+        # system manage VRR and picks it in the desktop's own settings.
+        return "never"
+
+    def release(self, monitors, keep_manual=False):
+        """Hands monitors back. keep_manual=True on quit: a tray "on" is a user setting, like HDR's."""
+        writes = []
+        for m in monitors:
+            h = self.held.get(m.id)
+            if not h or (keep_manual and h["manual"]):
+                continue
+            if keep_manual:
+                h["games"].clear()
+            del self.held[m.id]
+            if m.vrr_on:
+                writes.append((m, h["before"]))
+        return writes
+
+    def forget_games(self, running_keys):
+        """Startup: drops the holds of games that are no longer running (crash recovery).
+
+        Returns [(monitor, word)] for the monitors whose last holder was gone, so the caller can put
+        them back. A monitor another game or a manual "on" still needs stays held.
+        """
+        writes = []
+        for mid, h in list(self.held.items()):
+            h["games"] = [k for k in h["games"] if k in running_keys]
+            if not h["games"] and not h["manual"]:
+                del self.held[mid]
+                writes.append((mid, h["before"]))
+        return writes
+
+
+def tray_rows(monitors, manages_vrr, ours, blocked):
+    """What the tray menu shows, as plain data so it can be tested without Qt.
+
+    Each monitor is a heading with its own HDR and VRR rows under it. A row is
+    ("heading", text) (drawn with a monitor icon; clicking it opens Settings), ("separator",), ("hdr" | "vrr", monitor, label, checked, enabled), or
+    ("take_over",) for the one link back to managing VRR. Rows carry a checked flag, drawn in the
+    menu as a ticked or empty box (see tray_state_icon). The VRR box is on/off only: ticked is
+    Always, anything else shows empty. Unavailable rows stay visible, greyed, with a short reason.
+    """
+    rows = []
+    for i, m in enumerate(monitors):
+        if i:
+            rows.append(("separator",))
+        rows.append(("heading", m.name))
+        rows.append(("hdr", m, "HDR" if m.hdr_supported else "HDR (N/A)", m.hdr_on, m.hdr_supported))
+        if not manages_vrr:
+            continue  # GNOME: no VRR control at all
+        if not m.vrr_supported:
+            rows.append(("vrr", m, "VRR (N/A)", False, False))
+        elif not ours:
+            rows.append(("vrr", m, "VRR (system)", m.vrr_on, False))  # the desktop's state, read-only
+        elif m.id in blocked:
+            rows.append(("vrr", m, "VRR (paused)", m.vrr_on, False))
+        else:
+            rows.append(("vrr", m, "VRR", m.vrr_on, True))
+    if manages_vrr and not ours and any(m.vrr_supported for m in monitors):
+        rows.append(("take_over",))
+    return rows
+
+
+def tray_label(label):
+    """The text of an HDR or VRR row: nudged right so it sits under the monitor name.
+
+    Leading spaces are the only indentation a tray menu row can carry: Plasma draws every row in
+    fixed columns (checkbox, icon, text) and DBusMenu has no padding. Figure spaces (U+2007) are
+    used because each one is exactly one digit wide, and because plain spaces are more likely to
+    be collapsed by the menu."""
+    return "\u2007\u2007\u2007" + label
+
+
+def tray_state_icon(checked):
+    """What an HDR or VRR row's box looks like: "filled" when on, "empty" when off.
+
+    Not an icon-theme name, because no theme can express "off" as a box: Breeze's
+    actions/16/checkbox.svg is a symlink to dialog-ok-apply.svg, a box *with* a tick, and there is no
+    empty-box icon at all. Asking for "checkbox" and "checkbox-checked" therefore drew a tick for both
+    and every row looked on. The box is drawn in TrayApp.state_icon instead.
+    """
+    return "filled" if checked else "empty"
+
+
+def vrr_inert(game, system_managed):
+    """True when this game asks for VRR but it won't be applied."""
+    return game.vrr and system_managed
 
 
 # ------------------------------------------------------------------ A game's own settings
@@ -1062,6 +1281,10 @@ def run_ui(args):
             send(probe, "toggle " + args.toggle)
             probe.disconnectFromServer()
             return 0
+        if args.toggle_vrr:
+            send(probe, "toggle-vrr " + args.toggle_vrr)
+            probe.disconnectFromServer()
+            return 0
         send(probe, "hello " + VERSION)
         reply = bytes(probe.readAll()).decode(errors="replace") if probe.waitForReadyRead(1500) else ""
         if reply.startswith("version ") and not is_newer(VERSION, reply[8:]):
@@ -1084,9 +1307,9 @@ def run_ui(args):
 
     # ---------------------------------------------------------------- Theme and logo
     LIGHT = dict(bg="#ffffff", surface="#f6f6f8", border="#dedee4", text="#18181b", muted="#6c6c74",
-                 accent="#dc2634", hover="#b91c28", accent_text="#ffffff")
+                 accent="#dc2634", hover="#b91c28", accent_text="#ffffff", warn="#b45309")
     DARK = dict(bg="#000000", surface="#141418", border="#32323a", text="#f0f0f5", muted="#9696a0",
-                accent="#9358ff", hover="#7c3aed", accent_text="#ffffff")
+                accent="#9358ff", hover="#7c3aed", accent_text="#ffffff", warn="#f5a623")
     RAINBOW = ["#ff3b30", "#ff9500", "#ffcc00", "#34c759", "#007aff", "#5856d6", "#af52de"]
 
     font_id = QFontDatabase.addApplicationFont(str(Path(__file__).resolve().parent / "Orbitron.ttf"))
@@ -1138,6 +1361,7 @@ def run_ui(args):
             app.setStyleSheet("""
               QWidget {{ background: {bg}; color: {text}; }}
               QLabel[muted="true"] {{ color: {muted}; }}
+              QLabel[warning="true"] {{ color: {warn}; }}
               QPushButton {{ background: {surface}; border: none; padding: 7px 16px; min-height: 18px; }}
               QPushButton:hover {{ background: {border}; }}
               QPushButton[primary="true"] {{ background: {accent}; color: {accent_text}; }}
@@ -1227,6 +1451,12 @@ def run_ui(args):
     def muted(text):
         label = QLabel(text)
         label.setProperty("muted", True)
+        label.setWordWrap(True)
+        return label
+
+    def warning(text):
+        label = QLabel(text)
+        label.setProperty("warning", True)
         label.setWordWrap(True)
         return label
 
@@ -1371,6 +1601,7 @@ def run_ui(args):
             for key, name in selected.items():
                 self.options.setdefault(key, name + "  — not connected")
             self.names = {m.id: m.name for m in connected}
+            self.on_change = None
             self.clicked.connect(self.open_menu)
             self.refresh()
 
@@ -1392,12 +1623,16 @@ def run_ui(args):
             else:
                 self.chosen.pop(key, None)
             self.refresh()
+            if self.on_change:
+                self.on_change()
 
     class GameDialog(QDialog):
-        def __init__(self, parent, game, is_new, connected):
+        def __init__(self, parent, game, is_new, connected, manages_vrr=False):
             super().__init__(parent)
+            self.manages_vrr = manages_vrr
             self.setWindowTitle("Add HDR game" if is_new else "Edit HDR game")
             self.game = Game(**asdict(game))
+            self.original_vrr = game.vrr
             self.is_new = is_new
             form = QFormLayout(self)
             form.setHorizontalSpacing(24)
@@ -1414,6 +1649,9 @@ def run_ui(args):
             self.if_off = self.choice(0 if game.skip_if_off else 1, "Leave HDR off", "Offer HDR anyway")
             self.on_close = self.choice(0 if game.restore else 1, "Turn HDR back off", "Leave HDR on")
             self.tabbed = self.choice(1 if game.oled_care else 0, "Keep HDR on", "Turn HDR off (OLED care)")
+            self.vrr = self.choice(1 if game.vrr else 0, "Leave VRR alone", "Turn VRR on while playing")
+            if not self.a_manages_vrr(connected, selected):
+                self.vrr.setEnabled(False)
             # Display mode: the monitor, then the resolutions and refresh rates it offers.
             self.connected = connected
             self.mode_ids = [m.id for m in connected]
@@ -1436,8 +1674,16 @@ def run_ui(args):
                                ("If HDR is off in the game", self.if_off), ("When the game closes", self.on_close),
                                ("When tabbed out", self.tabbed), ("Display mode on", self.mode_monitor),
                                ("Resolution", self.resolution), ("Resolution applies to", self.apply_to),
-                               ("Refresh rate", self.refresh)):
+                               ("Refresh rate", self.refresh), ("VRR", self.vrr)):
                 form.addRow(label, box)
+            self.vrr_hint = muted("Put back to the previous setting when the game closes.")
+            form.addRow("", self.vrr_hint)
+            if not self.manages_vrr:
+                form.addRow("", muted("VRR management needs KDE Plasma"))
+            elif not cfg.vrr_ours:
+                form.addRow("", warning("Ignored while “Let the system manage VRR” is on (Settings › General)."))
+            self.monitors.on_change = self.vrr_availability
+            self.vrr_availability()
             row = QHBoxLayout()
             row.addStretch(1)
             row.addWidget(button("Save", self.accept_game, True))
@@ -1535,7 +1781,50 @@ def run_ui(args):
                 (g.mode_width, g.mode_height), g.mode_hz = self.selected_size(), self.selected_hz()
                 g.mode_in_game = self.apply_to.currentIndex() == 1
                 g.mode_monitor = self.mode_ids[self.mode_monitor.currentIndex()] if g.mode_width or g.mode_hz else ""
+                g.vrr = self.vrr.currentIndex() == 1
+                if g.vrr and not self.original_vrr and not cfg.vrr_ours and not self.vrr_warning():
+                    return  # the dialog stays open, with every other edit intact (self.game is a copy)
                 self.accept()
+
+        def a_manages_vrr(self, connected, selected):
+            """Whether the VRR row can do anything at all: KDE, and a selected monitor that supports VRR."""
+            if not self.manages_vrr:
+                return False
+            return any(m.vrr_supported for m in connected if m.id in selected)
+
+        def vrr_availability(self):
+            """Live: disabling the row as monitors are picked and unpicked."""
+            usable = self.a_manages_vrr(self.connected, self.monitors.chosen)
+            self.vrr.setEnabled(usable)
+            if usable and not cfg.vrr_ours:
+                self.vrr_hint.setText("Stored, but not applied while the system manages VRR.")
+            elif not usable and self.manages_vrr:
+                self.vrr_hint.setText("None of the selected monitors reports VRR support.")
+            else:
+                self.vrr_hint.setText("Put back to the previous setting when the game closes.")
+
+        def vrr_warning(self):
+            return vrr_warning(self)
+
+    def vrr_warning(parent):
+        """Asks what to do when a per-game VRR setting is meaningless because the system manages VRR.
+
+        Returns True (go ahead: save anyway, or take VRR over), False (cancel)."""
+        box = QMessageBox(QMessageBox.Icon.Warning, Build.name(),
+                          "VRR is set to be managed by your system, so this per-game setting won't be applied.\n\n"
+                          "Turn off “Let the system manage VRR” in Settings › General to use it.", parent)
+        keep = box.addButton("Save anyway", QMessageBox.ButtonRole.AcceptRole)
+        take = box.addButton("Let HDR Ultimate manage VRR", QMessageBox.ButtonRole.ActionRole)
+        box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(take)
+        box.exec()
+        if box.clickedButton() is take:
+            cfg.vrr_system_managed = False
+            cfg.save()
+            if getattr(getattr(parent, "a", None), "backend", None) is not None:
+                parent.a.update_indicator()
+            return True
+        return box.clickedButton() is keep
 
     # ---------------------------------------------------------------- Settings
     class Settings(QWidget):
@@ -1560,7 +1849,8 @@ def run_ui(args):
             theme.changed.connect(self.repaint_logo)
             self.repaint_logo()
 
-            self.columns = ["Game", "Exe", "Monitors"] + (["In-game HDR"] if Build.dev() else []) + ["Display mode", "On launch"]
+            self.columns = (["Game", "Exe", "Monitors"] + (["In-game HDR"] if Build.dev() else [])
+                            + ["Display mode"] + (["VRR"] if self.a.backend.manages_vrr else []) + ["On launch"])
             self.table = QTableWidget(0, len(self.columns))
             self.table.setHorizontalHeaderLabels(self.columns)
             self.table.verticalHeader().hide()
@@ -1643,11 +1933,32 @@ def run_ui(args):
                     cfg.save()
                 return changed
 
+            def set_vrr_system(managed):
+                cfg.vrr_system_managed = managed
+                cfg.save()
+                if managed:
+                    self.a.release_vrr()  # hand every monitor back, manual holds included
+                self.a.update_indicator()
+                self.vrr_hint.setVisible(managed)
+                self.refill()
+
             rows = [line("Theme", box),
                     line("Start at login", Toggle(Startup.enabled(), Startup.set)),
                     line("On-screen notice", Toggle(cfg.show_osd, flag("show_osd"))),
                     line("Auto HDR for games", Toggle(cfg.games_enabled, flag("games_enabled"))),
                     muted("Desktop: " + self.a.backend.desktop)]
+            if self.a.backend.manages_vrr:
+                rows.insert(4, line("Let the system manage VRR", Toggle(cfg.vrr_system_managed, set_vrr_system)))
+            else:
+                dead = Toggle(cfg.vrr_system_managed, None)
+                dead.setEnabled(False)
+                rows.insert(4, line("Let the system manage VRR", dead))
+            self.vrr_hint = warning("VRR is left to your desktop: no tray switch, hotkey or per-game change is applied.")
+            rows.insert(5, self.vrr_hint)
+            self.vrr_warning = muted("VRR management needs KDE Plasma" if not self.a.backend.manages_vrr else "")
+            rows.insert(6, self.vrr_warning)
+            self.vrr_hint.setVisible(cfg.vrr_system_managed and self.a.backend.manages_vrr)
+            self.vrr_warning.setVisible(not self.a.backend.manages_vrr)
             if Updates.offered():
                 latest = self.a.updates.latest
                 rows.insert(4, line("Version %s%s" % (VERSION, "  ·  %s is available" % latest if latest else ""),
@@ -1684,6 +1995,18 @@ def run_ui(args):
                 command = "%s --toggle %s" % (launcher, ids)
                 copy = button("Copy command", lambda c=command: (QGuiApplication.clipboard().setText(c), show_notice("Copied  ·  " + c)))
                 self.hot_rows.addWidget(line(label, copy))
+            if self.a.backend.manages_vrr:
+                vm = [m for m in self.a.backend.monitors() if m.vrr_supported]
+                if cfg.vrr_ours and vm:
+                    for m in vm:
+                        command = "%s --toggle-vrr %s" % (launcher, m.id)
+                        copy = button("Copy command", lambda c=command: (QGuiApplication.clipboard().setText(c),
+                                                                       show_notice("Copied  ·  " + c)))
+                        self.hot_rows.addWidget(line("%s — VRR" % m.name, copy))
+                elif cfg.vrr_system_managed and vm:
+                    self.hot_rows.addWidget(muted("VRR is managed by your system — turn that off in General to use these."))
+            else:
+                self.hot_rows.addWidget(muted("VRR management needs KDE Plasma"))
 
         def oled_page(self):
             time_row = QWidget()
@@ -1774,10 +2097,15 @@ def run_ui(args):
                 if Build.dev():
                     cells.append({True: "On", False: "Off"}.get(GameConfig.enabled_in(g.config), "—"))
                 cells.append(mode_summary(g))
+                if self.a.backend.manages_vrr:
+                    cells.append("On" if g.vrr else "—")
                 cells.append("Ask" if g.ask else "Automatic")
                 for col, text in enumerate(cells):
                     item = QTableWidgetItem(text)
                     item.setToolTip(g.exe)
+                    if self.columns[col] == "VRR" and vrr_inert(g, cfg.vrr_system_managed):
+                        item.setForeground(QColor(theme.p["muted"]))
+                        item.setToolTip("Not applied — VRR is managed by your system")
                     self.table.setItem(row, col, item)
             self.fill_oled_games()
             self.fill_hotkeys()
@@ -1794,7 +2122,8 @@ def run_ui(args):
             self.edit_game(index, Game(exe=exe, name=game_name_for(exe)))
 
         def edit_game(self, index, fresh=None):
-            dlg = GameDialog(self, fresh if index < 0 else cfg.games[index], index < 0, self.a.backend.monitors())
+            dlg = GameDialog(self, fresh if index < 0 else cfg.games[index], index < 0, self.a.backend.monitors(),
+                             self.a.backend.manages_vrr)
             if dlg.exec():
                 if index < 0:
                     cfg.games.append(dlg.game)
@@ -1804,6 +2133,9 @@ def run_ui(args):
                 if dlg.game.exe_file.lower() not in running_exes([dlg.game]):
                     GameConfig.apply_resolution(dlg.game)
                 self.saved()
+
+        def vrr_warning(self):
+            return vrr_warning(self)
 
         def cell_menu(self, row, col):
             """Double-clicking a cell opens that cell's options as a dropdown."""
@@ -1835,6 +2167,14 @@ def run_ui(args):
                     g.monitors = chooser.chosen
                     self.saved()
                 return
+            elif title == "VRR":
+                def set_vrr(on):
+                    if on and not g.vrr and not cfg.vrr_ours and not self.vrr_warning():
+                        return
+                    g.vrr = on
+                    self.saved()
+                menu.addAction("Leave VRR alone", lambda: set_vrr(False))
+                menu.addAction("Turn VRR on while playing", lambda: set_vrr(True))
             elif title == "In-game HDR":
                 def detect():
                     g.config = ""
@@ -1865,6 +2205,11 @@ def run_ui(args):
             self.mode_set = {}    # monitor -> (mode to go back to, exe names holding the change)
             self.mode_applied = {}  # exe name -> the display mode setting it started with, to apply changes made while it runs
             self.guard = ModeGuard()
+            self.vrr = VrrHolds(cfg.vrr_held)
+            self.vrr_pending = {}      # monitor -> (word, force): waiting for the guard; the latest request wins
+            self.vrr_expect = {}       # monitor -> (word, deadline): readback, the only failure signal
+            self.vrr_noticed = set()   # monitors already told that the desktop can't switch them
+            self.vrr_reconciled = False  # crash recovery ran on the first poll
             self.mode_pending = {}     # monitor -> (exe name, own_size, mode): waiting for the monitor to settle
             self.restore_pending = {}  # monitor -> mode to go back to, waiting likewise
             self.hdr_pending = {}      # monitor -> (on, done, reapply): HDR switches waiting for the monitor's own mode
@@ -1892,6 +2237,7 @@ def run_ui(args):
             self.server.newConnection.connect(self.command)
 
             app.aboutToQuit.connect(lambda: self.restore_modes(None, wait=True))  # don't leave a game's display mode behind
+            app.aboutToQuit.connect(lambda: self.release_vrr(keep_manual=True, wait=True))  # nor a game's VRR policy
             self.check_games()
             self.update_indicator()
             self.timer = QTimer(self)
@@ -1948,8 +2294,10 @@ def run_ui(args):
             self.check_games()
             self.update_running_modes()
             self.switch_pending_hdr()
+            self.switch_pending_vrr()
             self.apply_pending()
             self.check_oled()
+            self.check_vrr()
             self.update_indicator()
             self.usage.tick(cfg)
             if self.updates.tick(cfg):
@@ -1983,6 +2331,8 @@ def run_ui(args):
                 text = bytes(sock.readAll()).decode()
                 if text.startswith("toggle "):
                     self.toggle(text.split(" ", 1)[1].split(","))
+                elif text.startswith("toggle-vrr "):
+                    self.toggle_vrr(text.split(" ", 1)[1].split(","))
                 elif text == "show":
                     self.open_settings()
                 elif text.startswith("hello "):  # a newly launched copy, checking whether it's newer
@@ -2000,20 +2350,71 @@ def run_ui(args):
             if reason == QSystemTrayIcon.ActivationReason.Trigger:
                 self.open_settings()
 
+        def add_heading(self, name):
+            """A monitor name above its HDR and VRR rows: an enabled row with a monitor icon.
+
+            Plasma redraws the tray menu over DBusMenu, which drops fonts and section titles, and greys out
+            disabled rows. Compared on a live Plasma 6 tray (section, bold, plain enabled, icon): only the
+            icon makes the name stand out, at full contrast. Don't switch this to setFont or addSection;
+            they don't reach Plasma. The name can't sit further left: Plasma keeps the checkbox column.
+            Clicking it opens Settings, so a row that looks clickable does something sensible.
+            This icon does come from the icon theme (it is a monitor, which every theme has), unlike the
+            on/off boxes in state_icon."""
+            act = self.menu.addAction(name, self.open_settings)
+            act.setIcon(QIcon.fromTheme("video-display"))
+
+        def state_icon(self, checked):
+            """A small box drawn here: a tick inside it when on, just the outline when off.
+
+            Drawn rather than looked up in the icon theme, because no theme has an empty box (see
+            tray_state_icon). It takes the menu's own text colour, so it reads on light and dark trays
+            alike, and Qt greys it for a disabled row by itself."""
+            size, colour = 16, self.menu.palette().color(QPalette.ColorRole.WindowText)
+            pix = QPixmap(size, size)
+            pix.fill(Qt.GlobalColor.transparent)
+            g = QPainter(pix)
+            g.setRenderHint(QPainter.RenderHint.Antialiasing)
+            g.setBrush(Qt.BrushStyle.NoBrush)
+            g.setPen(QPen(colour, 1.5))
+            g.drawRoundedRect(QRectF(1.75, 1.75, size - 3.5, size - 3.5), 3, 3)
+            if checked:
+                g.setPen(QPen(colour, 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+                path = QPainterPath()
+                path.moveTo(4.5, 8.3)
+                path.lineTo(6.9, 10.7)
+                path.lineTo(11.6, 5.4)
+                g.drawPath(path)
+            g.end()
+            return QIcon(pix)
+
         def build_menu(self):
             self.menu.clear()
-            for m in self.backend.monitors():
-                act = self.menu.addAction(m.name + ("" if m.hdr_supported else "  — no HDR"))
-                act.setCheckable(True)
-                act.setChecked(m.hdr_on)
-                act.setEnabled(m.hdr_supported)
-                act.triggered.connect(lambda _=False, mon=m: self.toggle_one(mon))
+            rows = tray_rows(self.backend.monitors(), self.backend.manages_vrr, cfg.vrr_ours, self.guard.blocked)
+            for row in rows:
+                kind = row[0]
+                if kind == "separator":
+                    self.menu.addSeparator()
+                elif kind == "heading":
+                    self.add_heading(row[1])
+                elif kind == "take_over":
+                    self.menu.addSeparator()
+                    self.menu.addAction("Manage VRR in HDR Ultimate\u2026", self.take_over_vrr)
+                else:
+                    _, m, label, checked, enabled = row
+                    act = self.menu.addAction(tray_label(label))
+                    act.setIcon(self.state_icon(checked))
+                    act.setEnabled(enabled)
+                    if kind == "hdr":
+                        act.triggered.connect(lambda _=False, mon=m: self.toggle_one(mon))
+                    else:
+                        act.setToolTip(self.vrr_blocked(m) or "Adaptive sync: " + (m.vrr_policy or "unknown").capitalize())
+                        act.triggered.connect(lambda _=False, mon=m: self.toggle_vrr([mon.id]))
             self.menu.addSeparator()
             for g in self.running.values():
                 self.menu.addAction("Detected: " + g.name).setEnabled(False)
             if self.updates.latest:
                 update = self.menu.addAction("Update available: " + self.updates.latest, self.updates.open)
-                bold = update.font()
+                bold = update.font()  # Plasma's tray ignores this (DBusMenu drops fonts); other trays may not
                 bold.setBold(True)
                 update.setFont(bold)
             self.menu.addAction("Settings", self.open_settings)
@@ -2024,11 +2425,19 @@ def run_ui(args):
             self.update_indicator()
 
         def update_indicator(self):
-            mons = [m for m in self.backend.monitors() if m.hdr_supported]
-            tip = "\n".join("%s: HDR %s" % (m.name, "ON" if m.hdr_on else "off") for m in mons) or "HDR Ultimate - no HDR monitors"
+            mons = [m for m in self.backend.monitors() if m.hdr_supported or m.vrr_supported]
+
+            def line(m):
+                parts = ["HDR " + ("ON" if m.hdr_on else "off")] if m.hdr_supported else []
+                if m.vrr_supported:
+                    parts.append("VRR " + (m.vrr_policy or "unknown").capitalize()
+                                 + (" (system)" if cfg.vrr_system_managed else ""))
+                return m.name + ": " + "  \u00b7  ".join(parts)
+
+            tip = "\n".join(line(m) for m in mons) or "HDR Ultimate - no HDR monitors"
             if tip != self.last_indicator:
                 self.last_indicator = tip
-                self.tray.setIcon(app_icon([m.hdr_on for m in mons]))
+                self.tray.setIcon(app_icon([m.hdr_on for m in mons if m.hdr_supported]))  # icon stays HDR-only
                 self.tray.setToolTip(tip)
 
         def notify(self, text, ms=1800):
@@ -2088,6 +2497,18 @@ def run_ui(args):
         def check_games(self):
             games = cfg.games if cfg.games_enabled else []
             found = running_exes(games)
+            if not self.vrr_reconciled:
+                # Startup after a crash or kill: the holds recorded for games that aren't running are
+                # dropped and their monitors put back, forced so a monitor the guard has blocked since
+                # is still handed back. A monitor another game or a manual "on" needs stays held.
+                self.vrr_reconciled = True
+                mons = {m.id: m for m in self.backend.monitors()}
+                stale = self.vrr.forget_games({g.exe_file.lower() for g in games if g.exe_file.lower() in found})
+                writes = [(mons[mid], word) for mid, word in stale if mid in mons and mons[mid].vrr_on]
+                if stale:
+                    log("VRR holds dropped after a restart: " + ", ".join("%s -> %s" % (mons[mid].name if mid in mons else mid, word)
+                                                                        for mid, word in stale))
+                    self.write_vrr(writes, force=True)
             for g in games:
                 key = g.exe_file.lower()
                 if key in found and key not in self.running:
@@ -2102,6 +2523,117 @@ def run_ui(args):
             ok = self.backend.set_hdr(m, on)
             self.guard.touched(m.id)  # switching HDR can make the desktop set the display mode again
             return ok
+
+        def vrr_blocked(self, m):
+            return vrr_blocked(m, self.backend.manages_vrr, cfg.vrr_ours, self.guard.blocked)
+
+        def write_vrr(self, writes, force=False, wait=False):
+            """Performs VrrHolds' writes: now if the guard allows, otherwise queued. Saves the holds.
+            force=True is a hand-back (close, release, quit): it runs even while the system manages VRR
+            or the monitor is blocked, because leaving a policy we wrote in place is worse. wait=True
+            (quitting) writes immediately instead of queueing: a queue would never drain."""
+            for m, word in writes:
+                why = "" if force else self.vrr_blocked(m)
+                if why:
+                    log("VRR %s on %s refused: %s" % (word, m.name, why))  # never even queued
+                    continue
+                if wait:
+                    delay = self.guard.wait(m.id)
+                    if delay > 0:
+                        time.sleep(delay)
+                    self.set_vrr(m, word)
+                elif m.id in self.vrr_pending or self.guard.wait(m.id) > 0:
+                    self.vrr_pending[m.id] = (word, force)
+                else:
+                    self.set_vrr(m, word)
+            self.save_vrr()
+
+        def set_vrr(self, m, word):
+            ok = self.backend.set_vrr(m, word)
+            self.guard.touched(m.id)  # a policy change is an output change too
+            if ok:
+                self.vrr_expect[m.id] = (word, time.monotonic() + ModeGuard.SLOW)
+            else:
+                self.notify("Could not change VRR on " + m.name)
+            return ok
+
+        def switch_pending_vrr(self):
+            """From the poll timer, after switch_pending_hdr: queued VRR writes whose guard has cleared."""
+            if not self.vrr_pending:
+                return
+            mons = {m.id: m for m in self.backend.monitors()}
+            for mon_id, (word, force) in list(self.vrr_pending.items()):
+                m = mons.get(mon_id)
+                if m is None:
+                    del self.vrr_pending[mon_id]
+                    continue
+                if not force and self.vrr_blocked(m):  # blocked meanwhile: drop it rather than hold it forever
+                    del self.vrr_pending[mon_id]
+                    log("VRR %s on %s dropped: %s" % (word, m.name, self.vrr_blocked(m) or "no longer ours"))
+                    continue
+                if self.guard.wait(mon_id) > 0:
+                    continue
+                del self.vrr_pending[mon_id]
+                self.set_vrr(m, word)
+
+        def check_vrr(self):
+            """From the poll timer: did the policy we asked for actually appear? Popen hides failures."""
+            if not self.vrr_expect:
+                return
+            mons = {m.id: m for m in self.backend.monitors()}
+            for mon_id, (word, deadline) in list(self.vrr_expect.items()):
+                m = mons.get(mon_id)
+                if m is None:
+                    del self.vrr_expect[mon_id]
+                elif m.vrr_supported and m.vrr_policy == word:
+                    del self.vrr_expect[mon_id]
+                elif time.monotonic() >= deadline:
+                    del self.vrr_expect[mon_id]
+                    log("VRR readback failed on %s: wanted %s, still %s" % (m.name, word, m.vrr_policy or "unknown"))
+                    self.notify("Could not change VRR on " + m.name)
+
+        def save_vrr(self):
+            if cfg.vrr_held != self.vrr.held:
+                cfg.vrr_held = {k: dict(v) for k, v in self.vrr.held.items()}
+                cfg.save()
+
+        def release_vrr(self, keep_manual=False, wait=False):
+            """Hands monitors back to their previous policy. Always forced: this is the way out of managing."""
+            self.vrr_pending = {k: v for k, v in self.vrr_pending.items() if v[1]}  # queued hand-backs survive
+            self.vrr_expect.clear()
+            self.write_vrr(self.vrr.release(self.backend.monitors(), keep_manual), force=True, wait=wait)
+            self.update_indicator()
+
+        def take_over_vrr(self):
+            """The tray's "Manage VRR in HDR Ultimate…": the user asks us to stop deferring to the desktop."""
+            cfg.vrr_system_managed = False
+            cfg.save()
+            self.notify("HDR Ultimate manages VRR now", 3000)
+            self.update_indicator()
+            if self.settings:
+                self.settings.refill()
+
+        def toggle_vrr(self, ids):
+            if not self.backend.manages_vrr:
+                return self.notify("VRR management needs KDE Plasma")
+            if not cfg.vrr_ours:
+                return self.notify("VRR is managed by your system")
+            targets = [m for m in self.backend.monitors() if m.id in ids]
+            mons = [m for m in targets if m.vrr_supported and not self.vrr_blocked(m)]
+            for m in targets:
+                if m.vrr_supported and self.vrr_blocked(m) and m.id not in self.vrr_noticed:
+                    self.vrr_noticed.add(m.id)
+                    self.notify(self.vrr_blocked(m), 9000)
+            if not mons:
+                if all(m.vrr_supported for m in targets):
+                    return
+                return self.notify("No VRR monitor from this hotkey is connected")
+            on = not all(m.vrr_on for m in mons)  # mixed -> all on; all on -> all back
+            writes = [(m, w) for m in mons for w in [self.vrr.manual(m, on)] if w]
+            self.write_vrr(writes)
+            if writes:
+                self.notify(("VRR on  \u00b7  " if on else "VRR off  \u00b7  ") + ", ".join(m.name for m, _ in writes))
+            self.update_indicator()
 
         def own_mode(self, m):
             """Whether the monitor is in its own mode, the one from before any game changed it."""
@@ -2166,9 +2698,26 @@ def run_ui(args):
             self.mode_applied[key] = running_mode_setting(g)
             # HDR first, then the game's mode in one change once the monitor has settled (see ModeGuard).
             quiet = self.start_hdr(g, key)
+            self.start_vrr(g, key)
             notice = self.apply_mode(g, key)
             if notice and not quiet:
                 self.notify(notice)
+
+        def start_vrr(self, g, key):
+            """Holds Always while a game runs. A monitor the desktop can't switch is skipped, not the game."""
+            if not (g.vrr and cfg.vrr_ours and self.backend.manages_vrr):
+                return  # nothing switched, so nothing recorded to undo
+            mons = [m for m in self.backend.monitors() if m.id in g.monitors and m.vrr_supported]
+            usable = [m for m in mons if not self.vrr_blocked(m)]
+            usable_ids = {m.id for m in usable}
+            for m in mons:
+                if m.id not in usable_ids and m.id not in self.vrr_noticed:
+                    self.vrr_noticed.add(m.id)
+                    self.notify(self.vrr_blocked(m), 9000)
+            writes = self.vrr.start(key, usable)
+            self.write_vrr(writes)
+            if writes:
+                log("VRR on for %s (%s)" % (g.name, ", ".join(m.name for m, _ in writes)))
 
         def start_hdr(self, g, key):
             """Turns HDR on for a game, or asks. Returns True when the mode notice should stay quiet: the HDR banner
@@ -2341,6 +2890,12 @@ def run_ui(args):
             # The display mode goes back first, then HDR turns off once the monitor has settled (see switch_hdr).
             mode_restored = bool(self.restore_modes(key))
             mons = {m.id: m for m in self.backend.monitors()}
+            # VRR last, and forced: a game that ran on a monitor the guard has since blocked still gets put back.
+            vrr_writes = self.vrr.stop(key, list(mons.values()))
+            for mon_id in mons:  # a queued "on" for a game that just closed must not fire
+                if mon_id not in self.vrr.held:
+                    self.vrr_pending.pop(mon_id, None)
+            self.write_vrr(vrr_writes, force=True)
             changed = []
             for path, holders in list(self.auto_on.items()):
                 if key not in holders:
@@ -2401,6 +2956,10 @@ def run_ui(args):
         tray_app.toggle(args.toggle.split(","))
         if not (args.keep or args.screenshot):
             QTimer.singleShot(2500, app.quit)
+    if args.toggle_vrr:
+        tray_app.toggle_vrr(args.toggle_vrr.split(","))
+        if not (args.keep or args.screenshot):
+            QTimer.singleShot(2500, app.quit)
     if args.screenshot:
         return take_screenshots(app, tray_app, args.screenshot, theme, QTimer)
     return app.exec()
@@ -2426,6 +2985,7 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(add_help=True, description="HDR Ultimate for Linux")
     parser.add_argument("--toggle", help="comma-separated monitors to toggle")
+    parser.add_argument("--toggle-vrr", dest="toggle_vrr", help="comma-separated monitors to toggle VRR on")
     parser.add_argument("--list", action="store_true", help="list monitors")
     parser.add_argument("--dev", action="store_true")
     parser.add_argument("--playtest", action="store_true")
@@ -2439,7 +2999,9 @@ def main():
 
     if args.list:
         for m in pick_backend().monitors():
-            print("%-12s %-20s %s" % (m.id, m.name, ("HDR on" if m.hdr_on else "HDR off") if m.hdr_supported else "no HDR"))
+            hdr = ("HDR on" if m.hdr_on else "HDR off") if m.hdr_supported else "no HDR"
+            vrr = (m.vrr_policy or "unknown").capitalize() if m.vrr_supported else "no VRR"
+            print("%-12s %-20s %-8s VRR %s" % (m.id, m.name, hdr, vrr))
         return 0
 
     # Under Wayland an app can't place its own windows, which the top-right notices rely on,
